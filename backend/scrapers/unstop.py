@@ -1,122 +1,138 @@
-import asyncio
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
-import uuid
+import httpx
+import re
 import json
-import sys
 from datetime import datetime
 
-async def _scrape_unstop_async():
-    url_target = "https://unstop.com/hackathons?oppstatus=open"
+async def scrape_unstop_hackathons():
+    """
+    Scrapes live hackathons from Unstop using their public API endpoint matching:
+    https://unstop.com/hackathons?oppstatus=open&usertype=students&domain=2&course=6&passingOutYear=2028
+    Plus general open hackathons for students to guarantee comprehensive results.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://unstop.com/hackathons?oppstatus=open&usertype=students&domain=2&course=6&passingOutYear=2028",
+    }
+    
+    # We query the user-specified student filter first, then general open hackathons to gather rich listings
+    urls = [
+        "https://unstop.com/api/public/opportunity/search-result?opportunity=hackathons&oppstatus=open&usertype=students&domain=2&course=6&passingOutYear=2028&per_page=15",
+        "https://unstop.com/api/public/opportunity/search-result?opportunity=hackathons&oppstatus=open&per_page=20"
+    ]
+    
     hackathons = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            print(f"Navigating to {url_target}...")
-            await page.goto(url_target, timeout=60000)
-            await page.wait_for_timeout(5000)
-            
-            # Scroll to load a few more
-            for _ in range(3):
-                await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                await page.wait_for_timeout(2000)
-            
-            html = await page.content()
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            seen = set()
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if '/hackathons/' in href.lower() or '/competitions/' in href.lower():
-                    apply_url = f'https://unstop.com{href}' if href.startswith('/') else href
-                    if apply_url in seen: continue
-                    seen.add(apply_url)
+    seen_ids = set()
+    
+    try:
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=20.0) as client:
+            for url in urls:
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
                     
-                    container = a.find_parent('div', class_=lambda c: c and ('listing' in c or 'card' in c or 'box' in c)) or a
-                    title_elem = container.find(['h2', 'h3'])
-                    title = title_elem.text.strip() if title_elem else 'Unknown Hackathon'
+                    data = resp.json()
+                    items = data.get("data", {}).get("data", [])
                     
-                    if title == 'Unknown Hackathon': continue
-                    
-                    texts = [t.strip() for t in container.find_all(string=True) if t.strip()]
-                    
-                    # Try to extract the Org
-                    org = texts[1] if len(texts) > 1 else 'Unstop'
-                    if 'KLE' in org or 'College' in org or 'Institute' in org or 'University' in org:
-                        pass # keep it
-                    else:
-                        for t in texts[1:]:
-                            if 'College' in t or 'Institute' in t or 'University' in t or 'Academy' in t:
-                                org = t
-                                break
-                    
-                    # Parse type (Unstop defaults to online unless specified in tags)
-                    h_type = 'virtual'
-                    for t in texts:
-                        t_lower = t.lower()
-                        if 'offline' in t_lower or 'in-person' in t_lower or 'campus' in t_lower:
-                            h_type = 'in-person'
-                            break
-                        elif 'hybrid' in t_lower:
-                            h_type = 'hybrid'
-                            break
-                            
-                    # Find theme
-                    theme = 'Open Innovation'
-                    for t in texts:
-                        if t not in [title, org, 'offline', 'online', 'hybrid'] and len(t) < 30 and 'days' not in t.lower() and 'left' not in t.lower() and 'team' not in t.lower():
-                            if not any(x in t for x in ['₹', 'INR', 'Rs']) and not t.replace(',', '').isdigit():
-                                theme = t
-                                break
-                    
-                    prize = 0
-                    date_str = datetime.now().isoformat()
-                    
-                    for t in texts:
-                        if 'days left' in t.lower() or 'registered' in t.lower() or 'team' in t.lower(): continue
+                    for item in items:
+                        item_id = str(item.get("id"))
+                        if not item_id or item_id in seen_ids:
+                            continue
+                        seen_ids.add(item_id)
                         
-                        # Find Unstop prizes like '1,00,000' or '₹ 50,000'
-                        if any(x in t for x in ['₹', 'INR', 'Rs']) or (t.replace(',', '').isdigit() and len(t) > 3):
-                            try:
-                                num_str = ''.join(filter(str.isdigit, t))
-                                if num_str:
-                                    val = int(num_str)
-                                    if val > prize and val < 10000000: prize = val
-                            except: pass
+                        title = item.get("title") or "Unstop Hackathon"
+                        
+                        # Organization
+                        org_info = item.get("organisation") or {}
+                        if isinstance(org_info, dict):
+                            org = org_info.get("name") or "Unstop Partner"
+                        else:
+                            org = str(org_info)
                             
-                        match = re.search(r'(\d{2} \w{3} \d{2})|(\d{1,2}/\d{1,2}/\d{2,4})', t)
-                        if match:
-                            date_str = match.group(0)
+                        # Apply URL
+                        seo_url = item.get("seo_url")
+                        public_url = item.get("public_url")
+                        if seo_url and seo_url.startswith("http"):
+                            apply_url = seo_url
+                        elif public_url:
+                            apply_url = f"https://unstop.com/{public_url}" if not public_url.startswith("http") else public_url
+                        else:
+                            apply_url = f"https://unstop.com/hackathons/{item_id}"
+                            
+                        # Type
+                        h_type = "virtual"
+                        locations = item.get("locations") or []
+                        region = (item.get("region") or "").lower()
+                        if locations or "offline" in region or "campus" in region:
+                            h_type = "in-person"
+                        elif "hybrid" in region:
+                            h_type = "hybrid"
+                            
+                        # Theme
+                        filters = item.get("filters") or []
+                        themes = [f.get("name") for f in filters if isinstance(f, dict) and f.get("name") and f.get("name") != "All"]
+                        theme = ", ".join(themes[:2]) if themes else "Engineering & Coding"
+                        
+                        # Prize
+                        prizes = item.get("prizes") or item.get("prize") or 0
+                        prize_val = 0
+                        if isinstance(prizes, (int, float)):
+                            prize_val = int(prizes)
+                        elif isinstance(prizes, str):
+                            digits = re.sub(r"[^\d]", "", prizes)
+                            if digits:
+                                try:
+                                    prize_val = int(digits)
+                                except ValueError:
+                                    prize_val = 0
+                        elif isinstance(prizes, list) and prizes:
+                            first_p = prizes[0]
+                            if isinstance(first_p, dict):
+                                cash = first_p.get("cash") or first_p.get("amount") or 0
+                                digits = re.sub(r"[^\d]", "", str(cash))
+                                if digits:
+                                    prize_val = int(digits)
+                        
+                        # Dates
+                        start_date = item.get("start_date") or item.get("approved_date") or datetime.utcnow().isoformat()
+                        end_date = item.get("end_date") or start_date
+                        
+                        loc_name = "Online"
+                        if locations and isinstance(locations, list):
+                            first_loc = locations[0]
+                            if isinstance(first_loc, dict):
+                                loc_name = first_loc.get("city") or first_loc.get("state") or "In-Person"
+                            elif isinstance(first_loc, str):
+                                loc_name = first_loc
+                        elif h_type == "in-person":
+                            loc_name = "College / Campus"
+                        
+                        hackathons.append({
+                            "id": f"unstop-{item_id}",
+                            "title": title,
+                            "organization": org,
+                            "type": h_type,
+                            "theme": theme,
+                            "prizePool": prize_val,
+                            "startDate": str(start_date),
+                            "endDate": str(end_date),
+                            "applyUrl": apply_url,
+                            "source": "Unstop",
+                            "location": loc_name,
+                            "participants": item.get("registerCount", 0)
+                        })
+                except Exception as sub_e:
+                    print(f"[Unstop] Error querying endpoint {url}: {sub_e}")
                     
-                    hackathons.append({
-                        "id": str(uuid.uuid4()),
-                        "title": title,
-                        "organization": org,
-                        "type": h_type,
-                        "theme": theme,
-                        "prizePool": prize,
-                        "startDate": date_str,
-                        "endDate": date_str,
-                        "applyUrl": apply_url,
-                        "source": "Unstop"
-                    })
-                            
-        except Exception as e:
-            print(f"Error scraping Unstop: {e}")
-        finally:
-            await browser.close()
-            
+    except Exception as e:
+        print(f"[Unstop] Scraping error: {e}")
+        
     return hackathons
 
-async def scrape_unstop_hackathons():
-    def _run_in_thread():
-        if sys.platform == "win32":
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        return asyncio.run(_scrape_unstop_async())
-    
-    return await asyncio.to_thread(_run_in_thread)
-
 if __name__ == "__main__":
-    res = asyncio.run(scrape_unstop_hackathons())
-    print(json.dumps(res, indent=2))
+    import asyncio
+    results = asyncio.run(scrape_unstop_hackathons())
+    print(f"Scraped {len(results)} Unstop hackathons:")
+    for h in results[:3]:
+        print(f"- {h['title']} by {h['organization']} ({h['type']})")

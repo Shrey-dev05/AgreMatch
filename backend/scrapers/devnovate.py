@@ -1,110 +1,92 @@
-import asyncio
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
-import uuid
-import json
-import sys
+import httpx
 import re
+import json
 from datetime import datetime
 
-async def _scrape_devnovate_async():
-    url_target = "https://devnovate.co/events"
+async def scrape_devnovate_events():
+    """
+    Scrapes live hackathons/events from https://devnovate.co/events
+    via Devnovate's public event search API.
+    """
+    url = "https://devnovate.co/api/v1/events/search?page=1&limit=20&search=&filter=all"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://devnovate.co",
+        "Referer": "https://devnovate.co/events",
+    }
+    
     hackathons = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            print(f"Navigating to {url_target}...")
-            await page.goto(url_target, timeout=60000)
-            await page.wait_for_timeout(3000)
+    
+    try:
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=20.0) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                print(f"[Devnovate] Error fetching events: status {resp.status_code}")
+                return []
             
-            html = await page.content()
-            soup = BeautifulSoup(html, 'html.parser')
+            data = resp.json()
+            events = data.get("events") or data.get("data") or []
             
-            cards = set()
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if '/event/' in href.lower() or '/hackathon/' in href.lower():
-                    container = a.find_parent('div', class_=lambda c: c and 'group' in c) or a.find_parent('div', class_=lambda c: c and 'flex-col' in c and 'shadow' in c)
-                    if container and container not in cards:
-                        cards.add(container)
-                        title_elem = container.find(['h2', 'h3', 'h4'])
-                        if not title_elem: continue
-                        title = title_elem.text.strip()
-                        
-                        text_blocks = container.find_all(string=True)
-                        text_list = [t.strip() for t in text_blocks if t.strip()]
-                        
-                        # Parse type
-                        h_type = 'virtual'
-                        if 'OFFLINE' in text_list: h_type = 'in-person'
-                        elif 'HYBRID' in text_list: h_type = 'hybrid'
-                        
-                        # Parse Org
-                        org = "Devnovate"
-                        if 'Organized by' in text_list:
-                            idx = text_list.index('Organized by')
-                            if len(text_list) > idx + 1:
-                                org = text_list[idx + 1]
-                                
-                        # Parse Prize
-                        prize = 0
-                        for t in text_list:
-                            if any(x in t for x in ['₹', 'INR', 'Rs']):
-                                try:
-                                    num_str = ''.join(filter(str.isdigit, t))
-                                    if num_str:
-                                        val = int(num_str)
-                                        if val > prize: prize = val
-                                except: pass
-                                
-                        # Parse Date (e.g., '01-02-2026' or 'Starts 02-04-2026')
-                        date_str = datetime.now().isoformat()
-                        for t in text_list:
-                            match = re.search(r'(\d{2}-\d{2}-\d{4})', t)
-                            if match:
-                                date_str = match.group(1)
-                                break
-                            
-                        # Theme (first real tag usually)
-                        theme = "Open Theme"
-                        for t in text_list:
-                            if t not in ['ONLINE', 'OFFLINE', 'HYBRID', 'OPEN', 'Organized by', org, 'Apply Now'] and 'registered' not in t and 'Starts' not in t and not 'Tags' in t and len(t) < 30:
-                                theme = t
-                                break
-                                
-                        apply_url = f'https://devnovate.co{href}' if href.startswith('/') else href
-                        
-                        # Duplicate check
-                        if not any(h.get('applyUrl') == apply_url for h in hackathons):
-                            hackathons.append({
-                                "id": str(uuid.uuid4()),
-                                "title": title,
-                                "organization": org,
-                                "type": h_type,
-                                "theme": theme,
-                                "prizePool": prize,
-                                "startDate": date_str,
-                                "endDate": date_str,
-                                "applyUrl": apply_url,
-                                "source": "Devnovate"
-                            })
-                            
-        except Exception as e:
-            print(f"Error scraping Devnovate: {e}")
-        finally:
-            await browser.close()
-            
+            for item in events:
+                event_id = item.get("_id") or str(item.get("id", ""))
+                title = item.get("eventName") or item.get("name") or "Devnovate Hackathon"
+                org = item.get("organizationName") or item.get("organizer") or "Devnovate"
+                
+                # Location and type
+                loc = (item.get("location") or "").strip()
+                loc_lower = loc.lower()
+                if "offline" in loc_lower or "in-person" in loc_lower or "campus" in loc_lower or "hall" in loc_lower:
+                    h_type = "in-person"
+                elif "hybrid" in loc_lower:
+                    h_type = "hybrid"
+                else:
+                    h_type = "virtual"
+                
+                theme = item.get("theme") or "Tech & Innovation"
+                
+                # Prize pool extraction
+                prize_raw = item.get("prizePool") or item.get("prizes") or 0
+                prize_val = 0
+                if isinstance(prize_raw, (int, float)):
+                    prize_val = int(prize_raw)
+                elif isinstance(prize_raw, str):
+                    digits = re.sub(r"[^\d]", "", prize_raw)
+                    if digits:
+                        try:
+                            prize_val = int(digits)
+                        except ValueError:
+                            prize_val = 0
+                
+                # Dates
+                start_date = item.get("startDate") or item.get("registrationDeadline") or datetime.utcnow().isoformat()
+                end_date = item.get("endDate") or start_date
+                
+                apply_url = f"https://devnovate.co/events/{event_id}" if event_id else "https://devnovate.co/events"
+                
+                hackathons.append({
+                    "id": f"devnovate-{event_id}",
+                    "title": title,
+                    "organization": org,
+                    "type": h_type,
+                    "theme": theme,
+                    "prizePool": prize_val,
+                    "startDate": str(start_date),
+                    "endDate": str(end_date),
+                    "applyUrl": apply_url,
+                    "source": "Devnovate",
+                    "location": loc if loc else ("Online" if h_type == "virtual" else "In-Person"),
+                    "participants": item.get("numberOfRegistrations", 0)
+                })
+                
+    except Exception as e:
+        print(f"[Devnovate] Scraping error: {e}")
+        
     return hackathons
 
-async def scrape_devnovate_events():
-    def _run_in_thread():
-        if sys.platform == "win32":
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        return asyncio.run(_scrape_devnovate_async())
-    
-    return await asyncio.to_thread(_run_in_thread)
-
 if __name__ == "__main__":
-    res = asyncio.run(scrape_devnovate_events())
-    print(json.dumps(res, indent=2))
+    import asyncio
+    results = asyncio.run(scrape_devnovate_events())
+    print(f"Scraped {len(results)} Devnovate hackathons:")
+    for h in results[:3]:
+        print(f"- {h['title']} by {h['organization']} ({h['type']}) Prize: {h['prizePool']}")
